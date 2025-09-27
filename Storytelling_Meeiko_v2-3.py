@@ -22,19 +22,29 @@ import math
 import hashlib
 
 # ---------- CONFIG ----------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # required
-EMBED_MODEL = "text-embedding-3-small"  # cambiar si quieres
-COMPLETION_MODEL = "gpt-4o-mini"  # ejemplo, cambia si tu cuenta no lo soporta
+from dotenv import load_dotenv
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+EMBED_MODEL = "text-embedding-3-small"
+COMPLETION_MODEL = "gpt-4o-mini"
 INDEX_FILE = "faiss.index"
 DOCS_META_FILE = "docs_meta.json"
 LOG_FILE = "chat_logs.jsonl"
 # ----------------------------
 
 if not OPENAI_API_KEY:
-    st.error("Falta la variable de entorno OPENAI_API_KEY. Define OPENAI_API_KEY antes de ejecutar.")
+    st.warning("No se encontró OPENAI_API_KEY. Puedes ponerlo en un .env o pegarlo aquí.")
+    secret_key = st.text_input("Pega tu OpenAI API key", type="password")
+    if secret_key:
+        OPENAI_API_KEY = secret_key
+
+if not OPENAI_API_KEY:
+    st.error("Falta la API key. Define OPENAI_API_KEY antes de ejecutar.")
     st.stop()
 
-openai.api_key = OPENAI_API_KEY
+from openai import OpenAI
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------- Utilities ----------
 def chunk_text(text: str, max_tokens: int = 400) -> List[str]:
