@@ -8,7 +8,9 @@ import time
 
 # OpenAI imports
 import openai
-from openai.error import OpenAIError
+# ✅ nuevo
+from openai import OpenAIError
+
 
 # FAISS + utilities
 import faiss
