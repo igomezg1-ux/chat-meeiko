@@ -1,6 +1,7 @@
-streamlit>=1.20
-openai>=1.0.0
-faiss-cpu>=1.7.2
-pandas
-tiktoken
-numpy
+streamlit>=1.32.0
+pandas>=2.2.0
+numpy>=1.26.0
+faiss-cpu>=1.7.4
+openai>=1.30.0
+tiktoken>=0.7.0
+python-dotenv>=1.0.1
