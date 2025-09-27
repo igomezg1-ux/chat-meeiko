@@ -1,4 +1,4 @@
-# app.py (versión sin OpenAI; embeddings locales con sentence-transformers)
+# app.py (versión local con sentence-transformers)
 import os
 import time
 import json
@@ -12,27 +12,35 @@ import faiss
 from dotenv import load_dotenv
 load_dotenv()
 
-# Sentence Transformers (embeddings locales)
-from sentence_transformers import SentenceTransformer
+# Intento seguro de importar sentence-transformers
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except Exception as _e:
+    SentenceTransformer = None
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    import traceback
+    _import_warn = traceback.format_exc()
 
 # Config
-EMBED_MODEL_LOCAL = "all-MiniLM-L6-v2"   # ligero y efectivo
+EMBED_MODEL_LOCAL = "all-MiniLM-L6-v2"   # modelo SBERT local
 COMPLETION_STYLE = "template"            # indicativo: usamos plantilla
 INDEX_FILE = "faiss.index"
 DOCS_META_FILE = "docs_meta.json"
 LOG_FILE = "chat_logs.jsonl"
 DEFAULT_BATCH_SIZE = 128
 
-# Load local SBERT model (download la primera vez)
+# Cargar modelo SBERT (si está disponible)
 @st.cache_resource(show_spinner=False)
 def load_sbert_model(model_name: str = EMBED_MODEL_LOCAL):
+    if not SENTENCE_TRANSFORMERS_AVAILABLE:
+        return None
     return SentenceTransformer(model_name)
 
 sbert_model = load_sbert_model()
 
 # ---------- Utilities ----------
 def chunk_text(text: str, max_tokens: int = 400) -> List[str]:
-    # Aproximación simple: cortar por caracteres (4 chars ~ 1 token)
     approx_char = max_tokens * 4
     text = text.replace("\r\n", "\n")
     return [text[i:i+approx_char] for i in range(0, len(text), approx_char)]
@@ -59,6 +67,9 @@ def get_embedding_local(texts: List[str], batch_size: int = DEFAULT_BATCH_SIZE, 
     """
     Devuelve embeddings (listas de floats) usando sentence-transformers.
     """
+    if not SENTENCE_TRANSFORMERS_AVAILABLE or sbert_model is None:
+        raise RuntimeError("sentence-transformers no está disponible. Instala 'sentence-transformers' e intenta de nuevo.")
+
     embeddings = []
     total = len(texts)
     if total == 0:
@@ -69,7 +80,6 @@ def get_embedding_local(texts: List[str], batch_size: int = DEFAULT_BATCH_SIZE, 
     for i in range(0, total, batch_size):
         batch = texts[i:i+batch_size]
         embs = sbert_model.encode(batch, show_progress_bar=False, convert_to_numpy=True)
-        # convertir a lista por compatibilidad con FAISS + json
         embeddings.extend([e.tolist() for e in embs])
         if progress:
             progress.progress(min(1.0, (i + len(batch)) / total))
@@ -95,7 +105,11 @@ def build_index_from_dataframe(df: pd.DataFrame, text_column: str, batch_size: i
 
     st.info(f"Generando embeddings locales para {len(docs)} fragmentos... (esto puede tardar)")
     progress_bar = st.progress(0)
-    embeddings = get_embedding_local(docs, batch_size=batch_size, st_progress=progress_bar)
+    try:
+        embeddings = get_embedding_local(docs, batch_size=batch_size, st_progress=progress_bar)
+    except Exception as e:
+        st.error(f"Error generando embeddings locales: {e}")
+        return None, []
 
     if not embeddings or len(embeddings) != len(docs):
         st.error("Embeddings fallaron o no se generaron todos los embeddings.")
@@ -129,14 +143,9 @@ def search_index(index: faiss.IndexFlatIP, query: str, meta: List[dict], k: int 
 
 # ---------- Simple template-based answer generator ----------
 def generate_answer_template(user_question: str, context_snippets: List[str]) -> str:
-    """
-    Generador simple: resume los snippets y sugiere acciones heurísticas.
-    Útil cuando no se dispone de un LLM externo.
-    """
     if not context_snippets:
         return ("No se encontró información relevante en los documentos indexados. "
                 "Sugerencias:\n- Subir más datos/contexto.\n- Probar reformular la pregunta.\n- Hacer seguimiento con encuestas directas.")
-    # Hacer un pequeño 'resumen' concatenando previews (limitar longitud)
     resumen = "\n\n".join([f"- {s[:400].strip()}" for s in context_snippets[:5]])
     sugerencias = (
         "\n\nSugerencias heurísticas para oportunidades de mejora:\n"
@@ -146,7 +155,6 @@ def generate_answer_template(user_question: str, context_snippets: List[str]) ->
         "4) Recopilar métricas antes/después (NPS, tasa de conversión, errores).\n"
     )
     retorno = f"Contexto relevante (fragmentos):\n{resumen}\n\n{sugerencias}"
-    # Añadir nota de confidencialidad
     retorno += ("\nNota: Esta respuesta fue generada con un motor local basado en plantillas. "
                 "Si quieres respuestas más creativas o detalladas, conecta un LLM (por ejemplo OpenAI).")
     return retorno
@@ -157,6 +165,31 @@ st.title("Chatbot (RAG) — Embeddings locales y respuestas por plantilla")
 
 st.sidebar.markdown("### Opciones")
 tab = st.sidebar.radio("Navegación", ["Chat", "Indexar datos", "Logs y feedback", "Instrucciones", "Configuración"])
+
+# CONFIGURACIÓN: batch_size_cfg disponible en la UI
+if tab == "Configuración":
+    st.header("Configuración")
+    st.markdown("Modelo de embeddings local y parámetros")
+    st.text_input("Modelo de embeddings local", value=EMBED_MODEL_LOCAL, disabled=True)
+    batch_size_cfg = st.number_input("Batch size para embeddings", min_value=8, max_value=1024, value=DEFAULT_BATCH_SIZE)
+
+# Si la página no es Configuración, necesitamos aún exponer batch_size_cfg con valor por defecto
+if 'batch_size_cfg' not in locals():
+    # si no fue definido en la pestaña Configuración, asigna valor por defecto
+    batch_size_cfg = DEFAULT_BATCH_SIZE
+
+# Si sentence-transformers no está instalado, mostrar mensaje y bloquear indexado/chat
+if not SENTENCE_TRANSFORMERS_AVAILABLE:
+    st.error("La librería 'sentence-transformers' no está instalada en este entorno. "
+             "Instálala con `pip install sentence-transformers` o usa conda. "
+             "Revisa los logs para más detalle.")
+    st.code(_import_warn, language="text")
+    st.stop()
+
+# si el modelo no cargó por alguna razón, avisar
+if sbert_model is None:
+    st.error("No se pudo cargar el modelo sentence-transformers. Revisa la instalación.")
+    st.stop()
 
 if tab == "Instrucciones":
     st.header("Instrucciones rápidas")
@@ -170,12 +203,6 @@ if tab == "Instrucciones":
 """)
     st.markdown("Archivos locales creados: `faiss.index`, `docs_meta.json`, `chat_logs.jsonl`.")
 
-elif tab == "Configuración":
-    st.header("Configuración")
-    st.markdown("Modelos y parámetros (ajusta si lo deseas)")
-    st.text_input("Modelo de embeddings local", value=EMBED_MODEL_LOCAL, disabled=True)
-    batch_size_cfg = st.number_input("Batch size para embeddings", min_value=8, max_value=1024, value=DEFAULT_BATCH_SIZE)
-
 elif tab == "Indexar datos":
     st.header("Construir/Actualizar índice (local)")
     uploaded = st.file_uploader("Sube un CSV o Excel con textos (comentarios, FAQ, etc.)", type=["csv", "xlsx", "xls"])
@@ -187,6 +214,7 @@ elif tab == "Indexar datos":
                 df = pd.read_excel(uploaded)
             st.write("Vista previa:", df.head())
             col = st.selectbox("Columna de texto para indexar", options=list(df.columns))
+            # usar batch_size_cfg definido en la configuración (o por defecto)
             batch_size = st.number_input("Batch size para embeddings", min_value=8, max_value=1024, value=batch_size_cfg)
             if st.button("Construir índice desde este archivo"):
                 with st.spinner("Indexando (embeddings locales)..."):
