@@ -1,9 +1,7 @@
-# app.py
+# app.py (versión sin OpenAI; embeddings locales con sentence-transformers)
 import os
 import time
 import json
-import math
-import hashlib
 from typing import List, Tuple, Optional
 
 import streamlit as st
@@ -14,31 +12,23 @@ import faiss
 from dotenv import load_dotenv
 load_dotenv()
 
-# OpenAI modern client
-from openai import OpenAI
+# Sentence Transformers (embeddings locales)
+from sentence_transformers import SentenceTransformer
 
 # Config
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-EMBED_MODEL = "text-embedding-3-small"   # ajusta si necesitas otro
-COMPLETION_MODEL = "gpt-4o-mini"         # cambia si no lo soportas (ej: "gpt-3.5-turbo")
+EMBED_MODEL_LOCAL = "all-MiniLM-L6-v2"   # ligero y efectivo
+COMPLETION_STYLE = "template"            # indicativo: usamos plantilla
 INDEX_FILE = "faiss.index"
 DOCS_META_FILE = "docs_meta.json"
 LOG_FILE = "chat_logs.jsonl"
-DEFAULT_BATCH_SIZE = 256
+DEFAULT_BATCH_SIZE = 128
 
-# If user didn't set key in env, allow pasting in UI (session-only)
-if not OPENAI_API_KEY:
-    st.warning("No se encontró OPENAI_API_KEY. Puedes ponerla en un archivo .env o pegarla a continuación (solo en esta sesión).")
-    secret_key = st.text_input("Pega tu OpenAI API key (se mantendrá solo en la sesión)", type="password")
-    if secret_key:
-        OPENAI_API_KEY = secret_key
+# Load local SBERT model (download la primera vez)
+@st.cache_resource(show_spinner=False)
+def load_sbert_model(model_name: str = EMBED_MODEL_LOCAL):
+    return SentenceTransformer(model_name)
 
-if not OPENAI_API_KEY:
-    st.error("Falta la API key. Define OPENAI_API_KEY en .env o pégala arriba.")
-    st.stop()
-
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+sbert_model = load_sbert_model()
 
 # ---------- Utilities ----------
 def chunk_text(text: str, max_tokens: int = 400) -> List[str]:
@@ -64,23 +54,12 @@ def log_interaction(record: dict):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-# ---------- OpenAI Embeddings with batching and retries ----------
-def _call_embeddings_with_retry(batch: List[str], max_retries: int = 5, backoff_base: float = 1.0):
-    attempt = 0
-    while True:
-        try:
-            resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
-            # resp.data is a list of embedding objects
-            return [r.embedding for r in resp.data]
-        except Exception as e:
-            attempt += 1
-            if attempt > max_retries:
-                raise
-            sleep = backoff_base * (2 ** (attempt - 1))
-            time.sleep(sleep)
-
-def get_embedding(texts: List[str], batch_size: int = DEFAULT_BATCH_SIZE, st_progress: Optional[st.delta_generator] = None) -> List[List[float]]:
-    embeddings: List[List[float]] = []
+# ---------- Local embeddings (sentence-transformers) with batching ----------
+def get_embedding_local(texts: List[str], batch_size: int = DEFAULT_BATCH_SIZE, st_progress: Optional[st.delta_generator] = None) -> List[List[float]]:
+    """
+    Devuelve embeddings (listas de floats) usando sentence-transformers.
+    """
+    embeddings = []
     total = len(texts)
     if total == 0:
         return embeddings
@@ -89,20 +68,16 @@ def get_embedding(texts: List[str], batch_size: int = DEFAULT_BATCH_SIZE, st_pro
 
     for i in range(0, total, batch_size):
         batch = texts[i:i+batch_size]
-        try:
-            batch_emb = _call_embeddings_with_retry(batch)
-            embeddings.extend(batch_emb)
-        except Exception as e:
-            # bubble error to UI
-            st.error(f"Fallo en embeddings (batch {i}..{i+len(batch)-1}): {e}")
-            return []
+        embs = sbert_model.encode(batch, show_progress_bar=False, convert_to_numpy=True)
+        # convertir a lista por compatibilidad con FAISS + json
+        embeddings.extend([e.tolist() for e in embs])
         if progress:
             progress.progress(min(1.0, (i + len(batch)) / total))
     if progress:
         progress.progress(1.0)
     return embeddings
 
-# ---------- Index building/search ----------
+# ---------- Index building/search (FAISS) ----------
 def build_index_from_dataframe(df: pd.DataFrame, text_column: str, batch_size: int = DEFAULT_BATCH_SIZE):
     docs = []
     meta = []
@@ -115,12 +90,12 @@ def build_index_from_dataframe(df: pd.DataFrame, text_column: str, batch_size: i
                 "source": f"row_{idx}",
                 "row_index": int(idx),
                 "chunk_id": i,
-                "orig_preview": c[:200]
+                "orig_preview": c[:400]
             })
 
-    st.info(f"Generando embeddings para {len(docs)} fragmentos... (esto puede tardar)")
+    st.info(f"Generando embeddings locales para {len(docs)} fragmentos... (esto puede tardar)")
     progress_bar = st.progress(0)
-    embeddings = get_embedding(docs, batch_size=batch_size, st_progress=progress_bar)
+    embeddings = get_embedding_local(docs, batch_size=batch_size, st_progress=progress_bar)
 
     if not embeddings or len(embeddings) != len(docs):
         st.error("Embeddings fallaron o no se generaron todos los embeddings.")
@@ -132,12 +107,12 @@ def build_index_from_dataframe(df: pd.DataFrame, text_column: str, batch_size: i
     faiss.normalize_L2(arr)
     index.add(arr)
     save_index(index, meta)
-    st.success("Índice creado y guardado.")
+    st.success("Índice local creado y guardado.")
     return index, meta
 
 def search_index(index: faiss.IndexFlatIP, query: str, meta: List[dict], k: int = 4):
     try:
-        q_emb = get_embedding([query], batch_size=1, st_progress=None)
+        q_emb = get_embedding_local([query], batch_size=1, st_progress=None)
         if not q_emb:
             return []
         q = np.array(q_emb).astype('float32')
@@ -152,63 +127,57 @@ def search_index(index: faiss.IndexFlatIP, query: str, meta: List[dict], k: int 
         st.error(f"Error en búsqueda del índice: {e}")
         return []
 
-# ---------- Chat / Generation ----------
-def generate_answer(system_prompt: str, user_question: str, context_snippets: List[str]) -> str:
-    context_text = "\n\n---\n\n".join(context_snippets)
-    prompt = f"""
-Eres un asistente para clientes cuya tarea es ayudar a identificar oportunidades de mejora de productos y servicios.
-- Usa únicamente la información provista en CONTEXTO cuando sea posible.
-- Si debes inferir algo, dilo claramente.
-- Si la pregunta no está en el contexto, responde de manera útil y sugiere pasos para obtener más datos.
-
-CONTEXTO:
-{context_text}
-
-PREGUNTA DEL USUARIO:
-{user_question}
-
-RESPONDE:
-"""
-    try:
-        resp = client.chat.completions.create(
-            model=COMPLETION_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=600
-        )
-        # resp.choices is a list
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Error en generación: {e}"
+# ---------- Simple template-based answer generator ----------
+def generate_answer_template(user_question: str, context_snippets: List[str]) -> str:
+    """
+    Generador simple: resume los snippets y sugiere acciones heurísticas.
+    Útil cuando no se dispone de un LLM externo.
+    """
+    if not context_snippets:
+        return ("No se encontró información relevante en los documentos indexados. "
+                "Sugerencias:\n- Subir más datos/contexto.\n- Probar reformular la pregunta.\n- Hacer seguimiento con encuestas directas.")
+    # Hacer un pequeño 'resumen' concatenando previews (limitar longitud)
+    resumen = "\n\n".join([f"- {s[:400].strip()}" for s in context_snippets[:5]])
+    sugerencias = (
+        "\n\nSugerencias heurísticas para oportunidades de mejora:\n"
+        "1) Priorizar problemas que se repitan en los fragmentos.\n"
+        "2) Investigar la causa raíz (revisar logs / tickets asociados).\n"
+        "3) Probar una solución de baja inversión (MVP) para validar hipótesis.\n"
+        "4) Recopilar métricas antes/después (NPS, tasa de conversión, errores).\n"
+    )
+    retorno = f"Contexto relevante (fragmentos):\n{resumen}\n\n{sugerencias}"
+    # Añadir nota de confidencialidad
+    retorno += ("\nNota: Esta respuesta fue generada con un motor local basado en plantillas. "
+                "Si quieres respuestas más creativas o detalladas, conecta un LLM (por ejemplo OpenAI).")
+    return retorno
 
 # ---------- Streamlit UI ----------
-st.set_page_config(page_title="Chatbot Mejora Producto (RAG)", layout="centered")
-st.title("Chatbot para identificar oportunidades de mejora — Demo")
+st.set_page_config(page_title="Chatbot Mejora Producto (Local RAG)", layout="centered")
+st.title("Chatbot (RAG) — Embeddings locales y respuestas por plantilla")
 
+st.sidebar.markdown("### Opciones")
 tab = st.sidebar.radio("Navegación", ["Chat", "Indexar datos", "Logs y feedback", "Instrucciones", "Configuración"])
 
 if tab == "Instrucciones":
     st.header("Instrucciones rápidas")
     st.markdown("""
-1. Subir CSV/Excel con columna de texto (p.ej. `descripcion`, `comentarios_usuarios`).
-2. Ir a *Indexar datos* y elegir la columna. Click en *Construir índice*.
-3. En *Chat*, escribir preguntas. Las interacciones se guardan en logs.
-4. Pedir a testers que prueben y dejen feedback.
+- Esta versión usa **embeddings locales** con `sentence-transformers` y FAISS.
+- No requiere clave de OpenAI.
+- Flujo:
+  1. Subir CSV/Excel con una columna de texto (comentarios/FAQ/etc).
+  2. Indexar desde la pestaña *Indexar datos*.
+  3. Ir a *Chat* y hacer preguntas; el sistema devolverá fragmentos relevantes + sugerencias heurísticas.
 """)
-    st.markdown("Archivos locales generados: `faiss.index`, `docs_meta.json`, `chat_logs.jsonl`.")
+    st.markdown("Archivos locales creados: `faiss.index`, `docs_meta.json`, `chat_logs.jsonl`.")
 
 elif tab == "Configuración":
     st.header("Configuración")
-    st.markdown("Modelos y parámetros (cambia si tu cuenta no soporta alguno)")
-    st.text_input("EMBED_MODEL", value=EMBED_MODEL, disabled=True)
-    st.text_input("COMPLETION_MODEL", value=COMPLETION_MODEL, disabled=True)
-    st.number_input("Batch size para embeddings", min_value=16, max_value=1024, value=DEFAULT_BATCH_SIZE)
+    st.markdown("Modelos y parámetros (ajusta si lo deseas)")
+    st.text_input("Modelo de embeddings local", value=EMBED_MODEL_LOCAL, disabled=True)
+    batch_size_cfg = st.number_input("Batch size para embeddings", min_value=8, max_value=1024, value=DEFAULT_BATCH_SIZE)
 
 elif tab == "Indexar datos":
-    st.header("Construir/Actualizar índice")
+    st.header("Construir/Actualizar índice (local)")
     uploaded = st.file_uploader("Sube un CSV o Excel con textos (comentarios, FAQ, etc.)", type=["csv", "xlsx", "xls"])
     if uploaded:
         try:
@@ -218,32 +187,31 @@ elif tab == "Indexar datos":
                 df = pd.read_excel(uploaded)
             st.write("Vista previa:", df.head())
             col = st.selectbox("Columna de texto para indexar", options=list(df.columns))
-            batch_size = st.number_input("Batch size para embeddings", min_value=32, max_value=1024, value=DEFAULT_BATCH_SIZE)
+            batch_size = st.number_input("Batch size para embeddings", min_value=8, max_value=1024, value=batch_size_cfg)
             if st.button("Construir índice desde este archivo"):
-                with st.spinner("Indexando..."):
+                with st.spinner("Indexando (embeddings locales)..."):
                     index, meta = build_index_from_dataframe(df, col, batch_size=batch_size)
         except Exception as e:
             st.error(f"Error leyendo archivo: {e}")
     else:
-        st.info("Sube un archivo para indexar. Si ya tienes un índice guardado, no es necesario subir.")
+        st.info("Sube un archivo para indexar. Si ya tienes un índice guardado, no es necesario subir uno nuevo.")
 
 elif tab == "Chat":
     st.header("Chat")
-    system_prompt = st.text_area("Prompt de sistema (instrucciones al modelo)", value="Eres un asistente que ayuda a identificar oportunidades de mejora de productos/servicios. Sé claro, conciso y orientado al cliente.", height=120)
-
+    st.info("El sistema recupera fragmentos relevantes usando FAISS + embeddings locales y genera una respuesta basada en plantilla.")
     index, meta = load_index()
     if index is None:
         st.warning("No hay índice guardado. Ve a 'Indexar datos' y sube tus documentos.")
-    user_input = st.chat_input("Escribe la pregunta del cliente (p. ej. '¿Qué mejoras sugieres para el onboarding?')")
+    user_input = st.chat_input("Escribe la pregunta del cliente (ej. '¿Qué mejoras sugieres para el onboarding?')")
 
     if user_input:
         if index is None:
             st.error("No se puede responder sin índice. Indexa tus datos primero.")
         else:
-            with st.spinner("Buscando contexto y generando respuesta..."):
-                results_meta = search_index(index, user_input, meta, k=4)
+            with st.spinner("Buscando contexto..."):
+                results_meta = search_index(index, user_input, meta, k=6)
                 snippets = [r["orig_preview"] for r in results_meta] if results_meta else []
-                answer = generate_answer(system_prompt, user_input, snippets)
+                answer = generate_answer_template(user_input, snippets)
                 st.chat_message("user").write(user_input)
                 st.chat_message("assistant").write(answer)
 
@@ -282,3 +250,4 @@ elif tab == "Logs y feedback":
         st.download_button("Descargar logs (JSONL)", data="".join(lines), file_name="chat_logs.jsonl", mime="text/plain")
     else:
         st.info("No hay logs aún. Interactúa con el chatbot para generar datos.")
+
